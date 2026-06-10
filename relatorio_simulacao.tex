@@ -1,0 +1,541 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[brazilian]{babel}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{caption}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, calc}
+\usepackage{standalone}
+
+\geometry{a4paper, margin=2.5cm}
+\hypersetup{colorlinks=true, linkcolor=blue!70!black, citecolor=green!50!black, urlcolor=blue!60!black}
+
+\newcommand{\vtes}{V_{\text{tes}}}
+\newcommand{\vz}{V_z}
+
+\title{Modelo de Simulação de Eventos Discretos para a \textit{Air Tesourinha} do Corredor Eixão-UAM}
+\author{
+    Vítor Matos Guimarães\\222034360
+    \and
+    Eduardo Amaral Melo\\211038440
+}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Este documento apresenta a especificação formal do simulador de eventos discretos (DES) para uma estrutura individual de \textit{Air Tesourinha} pertencente ao corredor de mobilidade aérea urbana Eixão-UAM, em Brasília. A simulação foca exclusivamente na dinâmica interna da interseção, assumindo que os drones são gerados no ponto de entrada (\textit{Inpoint}) já operando em uma velocidade de interseção reduzida e constante ($V_{\text{tes}} = 10$\,m/s). O modelo incorpora um sistema de \textit{headway} dinâmico baseado em \textit{geofencing}, zonas de \textit{buffering} com capacidades finitas, e lógica de \textit{merge} baseada em \textit{gap} temporal. O comportamento de congestionamento é modelado pelo esgotamento físico dos \textit{buffers}, resultando no bloqueio da via principal. O objetivo principal é determinar a capacidade operacional máxima da tesourinha e identificar o ponto crítico de saturação para densidades variando de 500 a 2000 drones/hora, por meio de um \textit{grid search} com 10 replicações estocásticas de 4 horas cada.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% =====================================================================
+\section{Introdução}
+% =====================================================================
+
+O corredor Eixão-UAM é uma infraestrutura aérea urbana proposta para a faixa central de 45 metros do Eixão de Brasília, organizada em camadas verticais para diferentes classes de veículos aéreos não tripulados (UAVs). As \textit{Air Tesourinhas} são interseções aéreas locais que viabilizam manobras de pouso, decolagem, troca de via e mudança de sentido, sem interromper o fluxo contínuo de cruzeiro nas vias principais.
+
+A Figura \ref{fig:tesourinha} apresenta a alocação física dos \textit{buffers} e dos nós táticos que compõem a arquitetura central de cruzamento.
+
+\begin{figure}[H]
+    \centering
+    \scalebox{0.85}{\input{tesourinha.tex}}
+    \caption{Geometria e Alocação dos Nós da Air Tesourinha}
+    \label{fig:tesourinha}
+\end{figure}
+
+Este documento formaliza o modelo de simulação computacional para \textbf{uma única \textit{Air Tesourinha}}, operando em \textbf{um único sentido de tráfego}, com foco exclusivo no comportamento temporal em velocidade reduzida de aproximação. Trata-se de uma Simulação de Eventos Discretos (DES --- \textit{Discrete Event Simulation}) puramente matemática, sem representação visual, sem modelagem física de voo e sem considerações climáticas.
+
+\subsection{Objetivos}
+
+\begin{enumerate}
+    \item Demonstrar a \textbf{viabilidade operacional} do modelo de \textit{Air Tesourinha} para densidades realistas de tráfego aéreo urbano.
+    \item Determinar a \textbf{densidade crítica} ($\lambda^*$) a partir da qual ocorrem bloqueios físicos nas vias principais devido ao esgotamento de \textit{buffers}.
+    \item Quantificar \textbf{métricas de desempenho} (\textit{throughput}, \textit{delay}, tempo de \textit{buffer}) por meio de análise estatística.
+\end{enumerate}
+
+\subsection{Escopo e Delimitações}
+
+\begin{table}[H]
+\centering
+\caption{Delimitação do escopo da simulação.}
+\label{tab:escopo}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Aspecto} & \textbf{Escopo} \\
+\midrule
+Ambiente simulado     & Apenas a área interna da tesourinha (Inpoint $\to$ Outpoint) \\
+Sentidos de tráfego   & 1 (ex: Sul $\to$ Norte) \\
+Classe de drones      & Classe 2 (Medium UAVs, Layer 2: 80--120\,m) \\
+Modelo de velocidade  & $V_{\text{tes}} = 10$\,m/s e 15\,m/s (comparativo) \\
+Condições ambientais  & Ignoradas (sem vento, chuva, turbulência) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =====================================================================
+\section{Topologia da \textit{Air Tesourinha}}
+% =====================================================================
+
+\subsection{Estrutura Geométrica}
+
+A tesourinha ocupa um espaço retangular de \textbf{60\,m de comprimento} por \textbf{45\,m de largura}, contendo:
+
+\begin{itemize}
+    \item \textbf{Via A} e \textbf{Via B}: faixas aéreas paralelas fluindo no mesmo sentido ($X = 60 \to X = 0$).
+    \item \textbf{Zonas de manobra centrais}: localizadas entre as duas vias ($Y = 11$\,m a $Y = 34$\,m).
+    \item \textbf{Buffers IN/OUT}: interfaces bidirecionais sob a Via B ($Y = 35$\,m a $Y = 45$\,m).
+\end{itemize}
+
+\subsection{Nós Táticos (\textit{Waypoints} de Decisão)}
+
+Cada nó é um ponto na via principal onde o drone recebe ou executa um comando operacional:
+
+\begin{itemize}
+    \item \textbf{DIVERGE}: saída da via principal para um \textit{buffer}.
+    \item \textbf{MERGE}: entrada na via principal a partir de um \textit{buffer}.
+\end{itemize}
+
+\subsubsection{Nós da Via B ($Y = 40$\,m)}
+
+\begin{table}[H]
+\centering
+\caption{Nós táticos da Via B.}
+\label{tab:nos_via_b}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Nó} & \textbf{Posição $X$} & \textbf{Tipo} & \textbf{Função} \\
+\midrule
+$B_{\text{merge\_in}}$  & 57\,m & MERGE   & Entrada de drones do Buffer IN \\
+$B_{\text{div\_desc}}$  & 48\,m & DIVERGE & Desvio para pouso (Descend Buffer) \\
+$B_{\text{div\_sw}}$    & 34\,m & DIVERGE & Desvio para troca de via (Switch) \\
+$B_{\text{merge\_sw}}$  & 22\,m & MERGE   & Entrada de drones do Switch Buffer \\
+$B_{\text{merge\_el}}$  & 10\,m & MERGE   & Entrada de drones do Elevador \\
+$B_{\text{div\_out}}$   &  4\,m & DIVERGE & Desvio para Buffer OUT \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Nós da Via A ($Y = 5$\,m)}
+
+\begin{table}[H]
+\centering
+\caption{Nós táticos da Via A.}
+\label{tab:nos_via_a}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Nó} & \textbf{Posição $X$} & \textbf{Tipo} & \textbf{Função} \\
+\midrule
+$A_{\text{div\_desc}}$  & 48\,m & DIVERGE & Desvio para pouso (Descend Buffer) \\
+$A_{\text{div\_sw}}$    & 34\,m & DIVERGE & Desvio para troca de via (Switch) \\
+$A_{\text{merge\_sw}}$  & 22\,m & MERGE   & Entrada de drones do Switch Buffer \\
+$A_{\text{merge\_el}}$  & 10\,m & MERGE   & Entrada de drones do Elevador \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Zonas de \textit{Buffering}}
+
+\begin{table}[H]
+\centering
+\caption{Especificação dos \textit{buffers} da tesourinha.}
+\label{tab:buffers}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Buffer} & \textbf{Dimensão} & \textbf{Capacidade} & \textbf{Andares} & \textbf{Função} \\
+\midrule
+Descend Node    & 22\,m $\times$ 23\,m & 21 drones & 3 (7/andar)           & Espera para pouso \\
+Switch Node     & 16\,m $\times$ 23\,m & 16 drones & 2 (8/andar, espiral)  & Troca de via \\
+Buffer IN       & 30\,m $\times$ 10\,m & 10 drones & 1                     & Chegada da via oposta \\
+Buffer OUT      & 30\,m $\times$ 10\,m & 10 drones & 1                     & Saída para via oposta \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Vertistop (Layer 0)}
+
+O vertistop é a plataforma de solo ($Z = 0$) para pouso e decolagem. Possui capacidade máxima para 50 drones e inicia a simulação com 10 drones estacionados. A gestão interna é abstraída: drones decolam limitados apenas pela disponibilidade de \textit{merge gap} na via principal. Há também uma rotação humana periódica a cada 20 minutos.
+
+% =====================================================================
+\section{Modelo de \textit{Headway} Interno (\textit{Geofencing})}
+\label{sec:headway}
+% =====================================================================
+
+O distanciamento obedece ao modelo de \textit{Moving Block} dinâmico, baseado nos conceitos de \textit{lane geometry} e \textit{adaptive geofencing} propostos por Tony et al.~\cite{tony2021lane}. Para a simulação, assume-se que todo drone que entra no Inpoint ($X=60$) já atingiu a velocidade reduzida de interseção ($\vtes = 10$\,m/s) e opera na rede de comunicação ad-hoc de curto alcance (Modo Seguro).
+
+\subsection{Parâmetros Físicos Internos}
+
+\begin{table}[H]
+\centering
+\caption{Parâmetros cinemáticos dentro da tesourinha.}
+\label{tab:parametros}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Parâmetro} & \textbf{Símbolo} & \textbf{Valor} \\
+\midrule
+\textbf{Velocidade de interseção} & $\vtes$  & \textbf{10\,m/s} \\
+Velocidade vertical               & $\vz$    & 3\,m/s \\
+Desaceleração segura              & $a$      & 3\,m/s$^2$ ($\approx 0{,}3$\,G) \\
+Latência V2V curta (Modo Seguro)  & $t_{r}$  & 0{,}5\,s \\
+Comprimento físico do drone       & $L$      & 6\,m \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Fórmula do Geofence a 10 m/s}
+
+O tamanho total da bolha de segurança é:
+
+\begin{equation}
+G(\vtes) = \frac{\vtes^2}{2a} + \vtes \cdot t_r + L
+\label{eq:geofence}
+\end{equation}
+
+\begin{equation}
+G(10) = \frac{10^2}{6} + 10 \cdot 0{,}5 + 6 = 16{,}7 + 5 + 6 = \mathbf{27{,}7 \text{\,m}}
+\label{eq:geofence_tes}
+\end{equation}
+
+Esta distância é inferior à extensão total da tesourinha (60\,m), permitindo operações simultâneas dentro da infraestrutura.
+
+\subsection{Regimes de Headway}
+
+\subsubsection{Headway de Cruzeiro (Geração no Inpoint)}
+
+A separação temporal mínima de um drone em fluxo contínuo a 10\,m/s:
+
+\begin{equation}
+H_{\text{cruise}} = \frac{G(10)}{10} = \frac{27{,}7}{10} \approx \mathbf{2{,}8 \text{\,s}}
+\label{eq:headway_cruise_tes}
+\end{equation}
+
+Este valor define o distanciamento temporal mínimo exigido na geração de drones pelas fontes de Poisson no Inpoint.
+
+\subsubsection{Headway de Merge (Brecha de Inserção)}
+
+Para um \textit{merge} seguro de um drone saindo do \textit{buffer} (partindo de $V \approx 0$ para $10$\,m/s) entre dois drones trafegando na via principal, o \textit{gap} necessário deve acomodar $\sim$48\,m, ou um \textit{headway} temporal de:
+
+\begin{equation}
+H_{\text{merge}} = \frac{48}{10} \approx \mathbf{4{,}8 \text{\,s}}
+\label{eq:headway_merge}
+\end{equation}
+
+% =====================================================================
+\section{Fontes de Drones e Geração Estocástica}
+\label{sec:geracao}
+% =====================================================================
+
+\subsection{Processo de Geração}
+
+Drones são instanciados no sistema de três fontes independentes modeladas por processos de Poisson:
+1. \textbf{Inpoint Via A}: $\lambda_{A} \approx 0{,}5 \lambda_{\text{total}}$
+2. \textbf{Inpoint Via B}: $\lambda_{B} \approx 0{,}5 \lambda_{\text{total}}$
+3. \textbf{Buffer IN}: $\lambda_{\text{IN}} \approx 0{,}07 \lambda_{\text{total}}$ (simétrico ao fluxo \textit{Return OUT})
+
+As chegadas respeitam o $H_{\text{cruise}} = 2{,}8$\,s de separação mínima.
+
+\subsection{Distribuição dos Planos de Voo}
+
+\begin{table}[H]
+\centering
+\caption{Distribuição dos planos de voo para os drones chegando pelas vias principais.}
+\label{tab:planos}
+\begin{tabular}{@{}lcp{8cm}@{}}
+\toprule
+\textbf{Plano de Voo} & \textbf{Proporção} & \textbf{Descrição} \\
+\midrule
+Cruise      & $\sim$65\% & Travessia direta, sem manobras \\
+Descend     & $\sim$12\% & Pouso no vertistop via Descend Buffer \\
+Switch      & 11{,}5\%  & Troca de via (A $\leftrightarrow$ B) \\
+Return OUT  & 11{,}5\%  & Saída para a via de sentido oposto \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =====================================================================
+\section{Planos de Voo: Rotas Detalhadas}
+\label{sec:rotas}
+% =====================================================================
+
+\subsection{Drones Originários da Via B}
+\begin{enumerate}
+    \item \textbf{Cruise B}: $\text{Inpoint}_B \to \dots \to \text{Saída}_B$
+    \item \textbf{Descend}: $\text{Inpoint}_B \to B_{\text{div\_desc}} \to \text{Descend Buffer} \to \text{Vertistop}$
+    \item \textbf{Switch B$\to$A}: $\text{Inpoint}_B \to B_{\text{div\_sw}} \to \text{Switch Buffer} \to A_{\text{merge\_sw}} \to \text{Saída}_A$
+    \item \textbf{Return OUT}: $\text{Inpoint}_B \to B_{\text{div\_out}} \to \text{Buffer OUT} \to \text{Via Oposta}$
+\end{enumerate}
+
+\subsection{Drones Originários da Via A}
+\begin{enumerate}[resume]
+    \item \textbf{Cruise A}: $\text{Inpoint}_A \to \dots \to \text{Saída}_A$
+    \item \textbf{Descend}: $\text{Inpoint}_A \to A_{\text{div\_desc}} \to \text{Descend Buffer} \to \text{Vertistop}$
+    \item \textbf{Switch A$\to$B}: $\text{Inpoint}_A \to A_{\text{div\_sw}} \to \text{Switch Buffer} \to B_{\text{merge\_sw}} \to \text{Saída}_B$
+    \item \textbf{Return OUT via Switch}: $\text{Inpoint}_A \to A_{\text{div\_sw}} \to \text{Switch Buffer} \to B_{\text{merge\_sw}} \to B_{\text{div\_out}} \to \text{Buffer OUT} \to \text{Via Oposta}$
+\end{enumerate}
+
+\subsection{Drones Originários do Buffer IN}
+\begin{enumerate}[resume]
+    \item \textbf{Return IN $\to$ Via B}: $\text{Buffer IN} \to B_{\text{merge\_in}} \to \text{Cruise Via B} \to \text{Saída}_B$
+    \item \textbf{Return IN $\to$ Via A}: $\text{Buffer IN} \to B_{\text{merge\_in}} \to B_{\text{div\_sw}} \to \text{Switch Buffer} \to A_{\text{merge\_sw}} \to \text{Saída}_A$
+    \item \textbf{Return IN $\to$ Descend}: $\text{Buffer IN} \to B_{\text{merge\_in}} \to B_{\text{div\_desc}} \to \text{Descend Buffer} \to \text{Vertistop}$
+\end{enumerate}
+
+\subsection{Drones Decolando do Vertistop}
+\begin{enumerate}[resume]
+    \item \textbf{Takeoff $\to$ Via A}: $\text{Vertistop} \to \text{Elevador} \to A_{\text{merge\_el}} \to \dots \to \text{Saída}_A$
+    \item \textbf{Takeoff $\to$ Via B}: $\text{Vertistop} \to \text{Elevador} \to B_{\text{merge\_el}} \to \dots \to \text{Saída}_B$
+    \item \textbf{Takeoff $\to$ Return OUT}: $\text{Vertistop} \to \text{Elevador} \to B_{\text{merge\_el}} \to B_{\text{div\_out}} \to \text{Buffer OUT} \to \text{Via Oposta}$
+\end{enumerate}
+
+% =====================================================================
+\section{Tempos de Processamento}
+\label{sec:tempos}
+% =====================================================================
+
+\subsection{Tempos de Trânsito Internos}
+
+\begin{table}[H]
+\centering
+\caption{Tempos de trânsito estritos aos limites da tesourinha.}
+\label{tab:tempos_transito}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Segmento} & \textbf{Distância} & \textbf{Velocidade} & \textbf{Tempo} \\
+\midrule
+Entre nós consecutivos (via)     & 6--14\,m     & 10\,m/s            & 0{,}6--1{,}4\,s \\
+\textbf{Travessia completa (In $\to$ Out)} & 60\,m & 10\,m/s   & \textbf{6{,}0\,s} \\
+Manobra de \textit{diverge}      & $\sim$5--10\,m & $\sim$5\,m/s     & $\sim$1--2\,s \\
+Descida/Subida (Layer 2 $\leftrightarrow$ 0) & $\sim$100\,m & 3\,m/s       & $\sim$33\,s \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Tempos nos Buffers}
+
+\begin{table}[H]
+\centering
+\caption{Lógica de espera em cada \textit{buffer}.}
+\label{tab:tempos_buffers}
+\begin{tabular}{@{}lp{9cm}@{}}
+\toprule
+\textbf{Buffer} & \textbf{Lógica de Espera} \\
+\midrule
+Descend Buffer & FIFO. O drone espera autorização para pousar, condicionada ao término do pouso do drone anterior mais tempo de gestão $t_g \sim U(3, 8)$\,s. \\
+Switch Buffer  & FIFO. Espera até que a via de destino apresente um \textit{merge gap} $\geq 4{,}8$\,s. \\
+Buffer IN      & FIFO. Espera \textit{merge gap} $\geq 4{,}8$\,s no nó $B_{\text{merge\_in}}$. \\
+Buffer OUT     & FIFO sequencial. Tempo aleatório coerente com a travessia para a via oposta. \\
+Vertistop      & Sem espera interna (abstraído). Decolagem limitada a gap na via superior. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =====================================================================
+\section{Lógica de Congestionamento (O Fator de Saturação)}
+\label{sec:congestionamento}
+% =====================================================================
+
+\subsection{O Problema: Sobra de Capacidade vs. Variação Estocástica}
+
+Em velocidade nominal de $10$\,m/s, o \textit{headway} de $2{,}8$\,s suporta teoricamente $\sim$1285 drones/h, e os $4{,}8$\,s de \textit{gap} de \textit{merge} suportam $\sim$750 manobras/h por via. Como o \textit{Grid Search} avalia fluxos máximos combinados de até 500 drones/h, a via principal sempre terá \textbf{capacidade macroscópica sobrando} para absorver todos os \textit{merges}. 
+
+O verdadeiro mecanismo que gera o congestionamento no simulador não é o excesso de demanda nominal pura, mas a \textbf{natureza estocástica (Poisson) das chegadas}. ``Rajadas'' locais de drones se acumulando no Inpoint podem rapidamente esgotar a capacidade finita das filas (ex: 16 posições no \textit{Switch Buffer}) enquanto o primeiro drone da fila aguarda brechas estocásticas para se inserir na via de destino.
+
+\subsection{Backpressure Dinâmico no Inpoint}
+
+Para simular o efeito de retenção do tráfego no corredor antes da tesourinha, o gerador de drones (\textit{Inpoint}) monitora continuamente a ocupação máxima ($\rho$) registrada em todos os \textit{buffers}. Conforme $\rho$ cresce, o sistema aplica um \textit{backpressure} que causa dois efeitos:
+
+\begin{enumerate}
+    \item \textbf{Redução da Velocidade Gerada ($V_{\text{gen}}$)}: Drones passam a entrar e cruzar a tesourinha em uma velocidade inferior a $10$\,m/s, dando tempo aos \textit{buffers} para processar os drones à frente.
+    \item \textbf{Aumento do Intervalo de Chegada}: Os tempos gerados pelo processo de Poisson são espaçados por um fator proporcional à redução de velocidade ($\Delta t \times 10/V_{\text{gen}}$), simulando o alongamento das filas no corredor externo.
+\end{enumerate}
+
+A intensidade do \textit{backpressure} segue limiares discretos:
+\begin{itemize}
+    \item $\rho \le 50\%$: Estado Normal ($V_{\text{gen}} = 10$\,m/s, intervalos originais)
+    \item $50\% < \rho \le 70\%$: Estado de Atenção ($V_{\text{gen}} = 8$\,m/s, intervalos $+25\%$)
+    \item $70\% < \rho \le 90\%$: Estado Crítico ($V_{\text{gen}} = 6$\,m/s, intervalos $+66\%$)
+    \item $\rho > 90\%$: Estado de Saturação ($V_{\text{gen}} = 4$\,m/s, intervalos $+150\%$)
+\end{itemize}
+
+\subsection{Bloqueio Físico por Lotação (Efeito \textit{Spillback})}
+
+Apesar do alívio gerado pelo \textit{backpressure}, rajadas estocásticas agressivas podem levar a ocupação de um \textit{buffer} aos $100\%$ físicos. Nesse cenário extremo:
+
+\begin{enumerate}
+    \item O drone tentando entrar no \textit{buffer} lotado \textbf{para no nó de diverge}.
+    \item Drones subsequentes são forçados a parar, criando uma fila retrógrada (\textit{spillback}).
+    \item O travamento se propaga em cascata até o \textit{Inpoint}, causando um colapso local do fluxo na tesourinha.
+\end{enumerate}
+
+% =====================================================================
+\section{Modelo Dinâmico do Vertistop}
+\label{sec:vertistop_dinamico}
+% =====================================================================
+O vertistop segue a mesma dinâmica abstrata definida anteriormente, onde sua ocupação $Q_v(t)$ flutua baseada nas decolagens, pousos e uma rotação humana periódica (50\% de chance a cada 20 min).
+
+% =====================================================================
+\section{Métricas de Avaliação (KPIs)}
+\label{sec:kpis}
+% =====================================================================
+
+\begin{itemize}
+    \item \textbf{Delay médio por manobra}: o tempo de espera consumido nos \textit{buffers}.
+    \item \textbf{Throughput Efetivo}: taxa real de processamento do sistema.
+    \item \textbf{Taxa de Rejeição (Bloqueio)}: probabilidade de uma via travar por esgotamento físico dos \textit{buffers}.
+    \item \textbf{Densidade crítica ($\lambda^*$)}: limiar no qual as rajadas de Poisson sobrecarregam os buffers de modo insustentável.
+\end{itemize}
+
+% =====================================================================
+\section{Capacidade Teórica Máxima (\textit{Sanity Check})}
+\label{sec:sanity_check}
+% =====================================================================
+
+\begin{table}[H]
+\centering
+\caption{Limites geométricos fixos a 10\,m/s.}
+\label{tab:capacidade}
+\begin{tabular}{@{}llc@{}}
+\toprule
+\textbf{Métrica} & \textbf{Cálculo} & \textbf{Valor} \\
+\midrule
+Capacidade limite de Inpoint          & $3600 / 2{,}8$  & $\sim$1285\,drones/h por via \\
+Capacidade limite de \textit{Merges}  & $3600 / 4{,}8$  & $\sim$750\,merges/h por via \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =====================================================================
+\section{Desenho Experimental}
+\label{sec:experimental}
+% =====================================================================
+
+O simulador avaliará a tesourinha através de um \textit{Grid Search} com replicações estocásticas de 4 horas para cada cenário, totalizando inúmeras \textit{runs} independentes para garantir a validade dos dados.
+
+% =====================================================================
+\section{Resultados da Simulação Estocástica}
+\label{sec:resultados}
+% =====================================================================
+
+Para validar a escalabilidade do modelo e o impacto da velocidade estipulada, o \textit{Grid Search} foi escalonado de 500 a 2000 drones por hora de entrada (somando as vias A e B), simulando o pior cenário possível (chegadas sob distribuição de Poisson não regulada) em duas configurações de velocidade de via principal ($V_{\text{tes}}$).
+
+\subsection{Comparativo: 10 m/s vs 15 m/s}
+
+De acordo com o modelo cinemático de distanciamento seguro, velocidades maiores exigem bolhas de segurança (\textit{geofences}) e tempos de inserção (\textit{merge gaps}) quadraticamente maiores.
+\begin{itemize}
+    \item Para \textbf{10 m/s}: $H_{\text{merge}} = 4.8$ s.
+    \item Para \textbf{15 m/s}: $H_{\text{merge}} = 6.0$ s.
+\end{itemize}
+
+A Tabela \ref{tab:resultados_simulacao} sumariza a Vazão Efetiva (\textit{Throughput}) do modelo.
+
+\begin{table}[H]
+\centering
+\caption{Comparativo de \textit{Throughput}: 10 m/s vs 15 m/s}
+\label{tab:resultados_simulacao}
+\begin{tabular}{ccc}
+\toprule
+\textbf{Densidade Exigida (D/h)} & \textbf{Vazão a 10 m/s (D/h)} & \textbf{Vazão a 15 m/s (D/h)} \\
+\midrule
+500 & 591.9 & 586.2 \\
+800 & 924.7 & 898.8 \\
+1100 & 1244.0 & 1174.0 \\
+1400 & 1517.8 & 1406.3 \\
+1700 & 1761.8 & 1601.5 \\
+2000 & 2001.7 & 1757.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Conclusão: O Paradoxo da Velocidade}
+
+Os dados da simulação provam o contra-intuitivo ``Paradoxo da Velocidade'' em interseções de UAM. Embora uma velocidade de 15 m/s aparente ser mais rápida para percorrer a tesourinha em linha reta, o aumento obrigatório do \textit{merge gap} para 6.0s (a fim de manter a separação segura) atua como um gargalo no esvaziamento dos \textit{buffers}. 
+
+Como consequência direta, no limite extremo de 2000 drones/hora, o modelo a 15 m/s conseguiu processar apenas 1757.4 drones, resultando numa perda de mais de 12\% de vazão da malha em comparação aos 2001.7 drones processados a 10 m/s. 
+
+A simulação também nos permite as seguintes comprovações:
+\begin{enumerate}
+    \item \textbf{Superdimensionamento Geométrico:} A 10 m/s, os \textit{buffers} projetados possuem capacidade física redundante. Eles nunca ultrapassaram $\sim 25\%$ de suas lotações máximas, garantindo estado de fluxo contínuo.
+    \item \textbf{Inexistência de Spillback:} Para as densidades urbanas convencionais e até limiares de estresse absurdos, o sistema é auto-sustentável, absorvendo aglomerados estocásticos sem travar a via principal.
+    \item \textbf{Validação da Gestão 4D Integrada:} A simulação, ao ``prender'' os drones virtualmente via \textit{Backpressure} nas bordas do Inpoint, mimetizou a atuação de um sistema 4D distribuído no corredor. Isso prova que se os drones chegarem com velocidades reguladas no \textit{Inpoint}, o cruzamento operará em altíssima fluidez.
+\end{enumerate}
+
+Assim, conclui-se que o \textit{design} operacional estabelecendo a zona de cruzamento em 10 m/s é altamente eficiente e sua modelagem física escala com absoluta segurança frente a altas demandas urbanas.
+
+% =====================================================================
+\section{Resumo das Constantes do Simulador}
+\label{sec:constantes}
+% =====================================================================
+
+\begin{longtable}{@{}llc@{}}
+\caption{Constantes de configuração em \textit{Python}.} \label{tab:constantes} \\
+\toprule
+\textbf{Constante} & \textbf{Descrição} & \textbf{Valor} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Constante} & \textbf{Descrição} & \textbf{Valor} \\
+\midrule
+\endhead
+\midrule
+\multicolumn{3}{r}{\footnotesize \textit{Continua na próxima página}} \\
+\endfoot
+\bottomrule
+\endlastfoot
+% Velocidades
+$\vtes$                   & Velocidade da tesourinha (fixa) & 10\,m/s \\
+$\vz$                     & Velocidade vertical            & 3\,m/s \\
+$a$                       & Desaceleração segura           & 3\,m/s$^2$ \\
+$t_{r}$                   & Latência V2V (Modo Seguro)     & 0{,}5\,s \\
+$L$                       & Comprimento do drone           & 6\,m \\
+\midrule
+% Headway tesourinha
+$G(\vtes)$                & Geofence de segurança (10\,m/s) & 27{,}7\,m \\
+$H_{\text{cruise,tes}}$   & Headway cruzeiro interno       & 2{,}8\,s \\
+$H_{\text{merge}}$        & Headway de merge interno       & 4{,}8\,s \\
+\midrule
+% Geometria
+$L_{\text{tes}}$          & Comprimento da tesourinha       & 60\,m \\
+$t_{\text{trav}}$         & Tempo de travessia (cruise)     & 6{,}0\,s \\
+$t_{\text{desc}}$         & Tempo de descida vertical       & 33\,s \\
+$t_{\text{asc}}$          & Tempo de subida vertical        & 33\,s \\
+\midrule
+% Buffers
+$Q_{\text{desc}}^{\max}$    & Capacidade Descend Buffer    & 21 \\
+$Q_{\text{sw}}^{\max}$      & Capacidade Switch Buffer     & 16 \\
+$Q_{\text{IN}}^{\max}$      & Capacidade Buffer IN         & 10 \\
+$Q_{\text{OUT}}^{\max}$     & Capacidade Buffer OUT        & 10 \\
+$Q_v^{\max}$              & Capacidade Vertistop           & 50 \\
+$Q_v(0)$                  & Ocupação inicial Vertistop     & 10 \\
+\midrule
+% Simulação
+$T_{\text{sim}}$          & Duração por rodada              & 14\,400\,s (4\,h) \\
+$R$                       & Replicações                     & 10 \\
+$t_g$                     & Gestão pós-pouso (Layer 0)      & $U(3, 8)$\,s \\
+$\Delta T_h$              & Intervalo rotação humana        & 1\,200\,s (20\,min) \\
+$p_h$                     & Prob. de evento humano          & 0{,}5 \\
+\end{longtable}
+
+\begin{thebibliography}{9}
+
+\bibitem{tony2021lane}
+A.~Tony, A.~Ratnoo, and D.~Ghose,
+``Lane Geometry, Compliance Levels, and Adaptive Geo-fencing in CORRIDRONE Architecture for Urban Mobility,''
+in \textit{2021 International Conference on Unmanned Aircraft Systems (ICUAS)},
+IEEE, 2021, pp.~1611--1617.
+\textsc{doi}: \href{https://doi.org/10.1109/ICUAS51884.2021.9476745}{10.1109/ICUAS51884.2021.9476745}.
+
+\end{thebibliography}
+
+\end{document}
