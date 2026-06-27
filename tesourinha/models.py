@@ -42,11 +42,11 @@ class Via:
     }
 
     def __init__(self, env: simpy.Environment, name: str, speed: float):
-        self.env     = env
-        self.name    = name
-        self.speed   = speed
-        self.slots   = simpy.Resource(env, capacity=via_slots(speed))
-        self.n_slots = via_slots(speed)
+        self.env      = env
+        self.name     = name
+        self.speed    = speed
+        self.slots    = simpy.Resource(env, capacity=via_slots(speed))
+        self.n_slots  = via_slots(speed)
         self._last_at = {ep: -9999.0 for ep in self.ENTRY_WP}
         self._locks   = {ep: simpy.Resource(env, capacity=1) for ep in self.ENTRY_WP}
         self._wait_total = {ep: 0.0 for ep in self.ENTRY_WP}
@@ -58,10 +58,17 @@ class Via:
 
         with self._locks[entry_point].request() as lock:
             yield lock
-            wait = max(0.0, self._last_at[entry_point] + h_min - self.env.now)
-            if wait > 0:
+
+            # Lock  → serializa drones no mesmo entry point (O(1) por drone)
+            # While → recalcula após cada sleep para capturar fantasmas
+            #         gravados por drones de OUTROS entry points enquanto dormia
+            while True:
+                wait = max(0.0, self._last_at[entry_point] + h_min - self.env.now)
+                if wait <= 0:
+                    break
                 yield self.env.timeout(wait)
 
+            # Pré-registra passagens futuras até exit_x
             t_now = self.env.now
             for ep_name, ep_x in self.ENTRY_WP.items():
                 if entry_x <= ep_x <= exit_x:
