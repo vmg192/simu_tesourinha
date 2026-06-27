@@ -1,17 +1,14 @@
 import random
 import simpy
-from ..constants import TESOURINHA_CONFIG as C, FLIGHT_PLAN_CONFIG, SOURCE_CONFIG
-from ..models import Via, UAV_INTENTS, h_cruise, h_merge
+from ..constants import TESOURINHA_CONFIG as C, ROUTE_SCENARIOS, SOURCE_SCENARIOS
+from ..models import Via, h_cruise, h_merge
 
-
-# Mapa intent → (exit_x, função de headway)
-# exit_x é onde o drone VAI SAIR da via — necessário para o pré-registro
-# correto dos timestamps downstream no Via.merge()
-_INTENT_PARAMS = {
-    UAV_INTENTS.CRUISE:     (C["FINISH"],      h_cruise),
-    UAV_INTENTS.DESCEND:    (C["DESCEND"],     h_merge),
-    UAV_INTENTS.SWITCH:     (C["SWITCH_OUT"],  h_merge),
-    UAV_INTENTS.RETURN_OUT: (C["RETURN_OUT"],  h_merge),
+# Mapeia cada ação para o waypoint de saída correspondente
+_ACTION_WP = {
+    "FINISH":     "FINISH",
+    "DESCEND":    "DESCEND",
+    "SWITCH":     "SWITCH_OUT",
+    "RETURN_OUT": "RETURN_OUT",
 }
 
 
@@ -32,22 +29,34 @@ class Stats:
 
 class Tesourinha:
     """
-    Simulação completa de uma Air Tesourinha.
-
     Uso:
         env = simpy.Environment()
-        t   = Tesourinha(env, speed=10.0, lam=200, seed=42)
+        t   = Tesourinha(
+                env, speed=10.0, lam=200,
+                source_scenario="balanced",
+                route_scenario="default",
+                seed=42,
+              )
         t.run(14400)
         env.run(until=14400)
-        print(t.stats.completed, t.stats.spillback_events)
     """
 
-    def __init__(self, env: simpy.Environment, speed: float, lam: float, seed: int = 0):
-        self.env   = env
-        self.speed = speed
-        self.lam   = lam
-        self.stats = Stats()
-        self._rng  = random.Random(seed)
+    def __init__(
+        self,
+        env:             simpy.Environment,
+        speed:           float,
+        lam:             float,
+        source_scenario: str = "balanced",
+        route_scenario:  str = "default",
+        seed:            int = 0,
+    ):
+        self.env    = env
+        self.speed  = speed
+        self.lam    = lam
+        self.stats  = Stats()
+        self._rng   = random.Random(seed)
+        self._src   = SOURCE_SCENARIOS[source_scenario]
+        self._routes = ROUTE_SCENARIOS[route_scenario]
 
         self.via_A = Via(env, "A", speed)
         self.via_B = Via(env, "B", speed)
@@ -60,17 +69,17 @@ class Tesourinha:
     # ── Interface pública ─────────────────────────────────────────────────────
 
     def run(self, duration: float):
-        lam_A  = self.lam * SOURCE_CONFIG["HIGHWAY_A"] / 3600
-        lam_B  = self.lam * SOURCE_CONFIG["HIGHWAY_B"] / 3600
-        lam_bi = self.lam * SOURCE_CONFIG["BUFFER_IN"] / 3600
-        lam_vs = self.lam * SOURCE_CONFIG["VERTISTOP"]  / 3600
+        s = self._src
+        self.env.process(self._arrivals(self.lam * s["HIGHWAY_A"] / 3600, duration,
+                                        lambda: self._spawn_highway(self.via_A)))
+        self.env.process(self._arrivals(self.lam * s["HIGHWAY_B"] / 3600, duration,
+                                        lambda: self._spawn_highway(self.via_B)))
+        self.env.process(self._arrivals(self.lam * s["BUFFER_IN"] / 3600, duration,
+                                        self._spawn_buffer_in))
+        self.env.process(self._arrivals(self.lam * s["VERTISTOP"]  / 3600, duration,
+                                        self._spawn_vertistop))
 
-        self.env.process(self._arrivals(lam_A,  duration, lambda: self._spawn_highway(self.via_A)))
-        self.env.process(self._arrivals(lam_B,  duration, lambda: self._spawn_highway(self.via_B)))
-        self.env.process(self._arrivals(lam_bi, duration, self._spawn_buffer_in))
-        self.env.process(self._arrivals(lam_vs, duration, self._spawn_vertistop))
-
-    # ── Geradores de chegada (Poisson) ────────────────────────────────────────
+    # ── Geradores de chegada ──────────────────────────────────────────────────
 
     def _arrivals(self, lam: float, duration: float, spawn):
         while True:
@@ -80,131 +89,136 @@ class Tesourinha:
             spawn()
 
     def _spawn_highway(self, via: Via):
-        self.env.process(
-            self._drone(via, "INPOINT", C["INPOINT"], self._sample_intent())
-        )
+        actions = self._sample_route("INPOINT")
+        self.env.process(self._drone(via, "INPOINT", C["INPOINT"], actions))
 
     def _spawn_buffer_in(self):
-        # Tráfego oposto: entra sempre como CRUISE pois já passou pela
-        # tesourinha anterior e só precisa atravessar esta
-        self.env.process(
-            self._drone(self.via_B, "RETURN_IN", C["RETURN_IN"], UAV_INTENTS.CRUISE)
-        )
+        actions = self._sample_route("RETURN_IN")
+        self.env.process(self._drone(self.via_B, "RETURN_IN", C["RETURN_IN"], actions))
 
     def _spawn_vertistop(self):
         self.env.process(self._takeoff())
 
     # ── Processo principal do drone ───────────────────────────────────────────
 
-    def _drone(self, via: Via, entry: str, entry_x: float, intent: UAV_INTENTS):
+    def _drone(self, via: Via, entry: str, entry_x: float, actions: list):
         """
-        Ciclo de vida completo de um drone na via.
+        Processa uma sequência de ações em ordem.
+        Ações suportadas: FINISH, DESCEND, RETURN_OUT, SWITCH.
 
-        Ordem crítica em cada ponto de diverge:
-            1. drone chega ao waypoint (timeout de viagem)
-            2. pede o buffer ANTES de liberar o slot da via
-            3. se buffer cheio → drone SEGURA o slot → spillback real
-            4. só libera o slot quando entrar no buffer
+        SWITCH é a única ação que não encerra o processo:
+        o drone muda de via e continua processando as ações restantes.
+        Todas as outras encerram com return.
         """
-        t_born          = self.env.now
-        exit_x, h_fn    = _INTENT_PARAMS[intent]
-        h_min           = h_fn(via.speed)
+        t_born = self.env.now
+        current_via = via
+        current_x   = entry_x
+        remaining   = list(actions)
 
-        # ── 1. Espera gap correto considerando TODOS os drones da via ──
-        # Via.merge() usa _last_at: timestamps projetados de todos os
-        # drones que entraram em qualquer entry point a upstream
-        yield from via.merge(entry, h_min, exit_x)
+        # Merge inicial: exit_x é onde o drone vai sair da via pela primeira vez
+        exit_x = self._exit_x(current_x, remaining)
+        h_min  = h_cruise(via.speed) if entry == "INPOINT" else h_merge(via.speed)
+        yield from current_via.merge(entry, h_min, exit_x)
 
-        # ── 2. Ocupa slot físico na via ──
-        via_req = via.slots.request()
+        via_req = current_via.slots.request()
         t_slot  = self.env.now
         yield via_req
         if self.env.now > t_slot + 0.001:
             self.stats.spillback_events += 1
 
-        # ── 3. Executa plano de voo ──
+        while remaining:
+            action = remaining.pop(0)
 
-        if intent == UAV_INTENTS.CRUISE:
-            yield self.env.timeout(via.travel_time(entry_x, C["FINISH"]))
-            via.slots.release(via_req)
-            self.stats.record(self.env.now - t_born)
+            if action == "FINISH":
+                yield self.env.timeout(current_via.travel_time(current_x, C["FINISH"]))
+                current_via.slots.release(via_req)
+                self.stats.record(self.env.now - t_born)
+                return
 
-        elif intent == UAV_INTENTS.DESCEND:
-            yield self.env.timeout(via.travel_time(entry_x, C["DESCEND"]))
-            bfr = self.bfr_descend.request()
-            t   = self.env.now
-            yield bfr                        # bloqueia se buffer cheio
-            if self.env.now > t + 0.001:
-                self.stats.spillback_events += 1
-            via.slots.release(via_req)       # só sai da via após garantir vaga
-            yield self.env.timeout(self._rng.uniform(30, 60))
-            self.bfr_descend.release(bfr)
-            self.stats.record(self.env.now - t_born)
+            elif action == "DESCEND":
+                yield self.env.timeout(current_via.travel_time(current_x, C["DESCEND"]))
+                bfr = self.bfr_descend.request()
+                t   = self.env.now
+                yield bfr
+                if self.env.now > t + 0.001:
+                    self.stats.spillback_events += 1
+                current_via.slots.release(via_req)
+                yield self.env.timeout(self._rng.uniform(30, 60))
+                self.bfr_descend.release(bfr)
+                self.stats.record(self.env.now - t_born)
+                return
 
-        elif intent == UAV_INTENTS.SWITCH:
-            yield self.env.timeout(via.travel_time(entry_x, C["SWITCH_OUT"]))
-            bfr = self.bfr_switch.request()
-            t   = self.env.now
-            yield bfr
-            if self.env.now > t + 0.001:
-                self.stats.spillback_events += 1
-            via.slots.release(via_req)
+            elif action == "RETURN_OUT":
+                yield self.env.timeout(current_via.travel_time(current_x, C["RETURN_OUT"]))
+                bfr = self.bfr_return_out.request()
+                t   = self.env.now
+                yield bfr
+                if self.env.now > t + 0.001:
+                    self.stats.spillback_events += 1
+                current_via.slots.release(via_req)
+                yield self.env.timeout(self._rng.uniform(5, 15))
+                self.bfr_return_out.release(bfr)
+                self.stats.record(self.env.now - t_born)
+                return
 
-            # Merge na via oposta a partir do SWITCH_IN
-            target  = self.via_B if via.name == "A" else self.via_A
-            h_tgt   = h_merge(target.speed)
-            yield from target.merge("SWITCH_IN", h_tgt, C["FINISH"])
+            elif action == "SWITCH":
+                yield self.env.timeout(current_via.travel_time(current_x, C["SWITCH_OUT"]))
+                bfr = self.bfr_switch.request()
+                t   = self.env.now
+                yield bfr
+                if self.env.now > t + 0.001:
+                    self.stats.spillback_events += 1
+                current_via.slots.release(via_req)
 
-            tgt_req = target.slots.request()
-            t2      = self.env.now
-            yield tgt_req
-            if self.env.now > t2 + 0.001:
-                self.stats.spillback_events += 1
+                # Muda para via oposta — continua com as ações restantes
+                target      = self.via_B if current_via.name == "A" else self.via_A
+                next_exit_x = self._exit_x(C["SWITCH_IN"], remaining)
+                yield from target.merge("SWITCH_IN", h_merge(target.speed), next_exit_x)
 
-            self.bfr_switch.release(bfr)     # sai do buffer ao entrar na nova via
-            yield self.env.timeout(target.travel_time(C["SWITCH_IN"], C["FINISH"]))
-            target.slots.release(tgt_req)
-            self.stats.record(self.env.now - t_born)
+                via_req = target.slots.request()
+                t2      = self.env.now
+                yield via_req
+                if self.env.now > t2 + 0.001:
+                    self.stats.spillback_events += 1
 
-        elif intent == UAV_INTENTS.RETURN_OUT:
-            yield self.env.timeout(via.travel_time(entry_x, C["RETURN_OUT"]))
-            bfr = self.bfr_return_out.request()
-            t   = self.env.now
-            yield bfr
-            if self.env.now > t + 0.001:
-                self.stats.spillback_events += 1
-            via.slots.release(via_req)
-            yield self.env.timeout(self._rng.uniform(5, 15))
-            self.bfr_return_out.release(bfr)
-            self.stats.record(self.env.now - t_born)
+                self.bfr_switch.release(bfr)
+                current_via = target
+                current_x   = C["SWITCH_IN"]
 
-    # ── Decolagem do Vertistop ────────────────────────────────────────────────
+                # Guarda: se não sobrou nada após o switch, vai para FINISH
+                if not remaining:
+                    remaining.append("FINISH")
+
+    # ── Decolagem ─────────────────────────────────────────────────────────────
 
     def _takeoff(self):
-        """
-        Drone aguarda vaga no buffer de decolagem, transita pelo elevador
-        (33s de subida vertical) e entra na via no ASCEND como CRUISE.
-        """
         bfr = self.bfr_takeoff.request()
         yield bfr
         yield self.env.timeout(C["VERTICAL_TIME"])
         self.bfr_takeoff.release(bfr)
-        target = self._rng.choice([self.via_A, self.via_B])
-        self.env.process(
-            self._drone(target, "ASCEND", C["ASCEND"], UAV_INTENTS.CRUISE)
-        )
+        target  = self._rng.choice([self.via_A, self.via_B])
+        actions = self._sample_route("ASCEND")
+        self.env.process(self._drone(target, "ASCEND", C["ASCEND"], actions))
 
-    # ── Helper ────────────────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _sample_intent(self) -> UAV_INTENTS:
-        r, cum = self._rng.random(), 0.0
-        for key, intent in [
-            ("CRUISE",     UAV_INTENTS.CRUISE),
-            ("DESCEND",    UAV_INTENTS.DESCEND),
-            ("SWITCH",     UAV_INTENTS.SWITCH),
-            ("RETURN_OUT", UAV_INTENTS.RETURN_OUT),
-        ]:
-            cum += FLIGHT_PLAN_CONFIG[key]
+    def _exit_x(self, current_x: float, actions: list) -> float:
+        """Posição de saída da via para a próxima ação, respeitando geometria."""
+        if not actions:
+            return C["FINISH"]
+        wp_name = _ACTION_WP.get(actions[0], "FINISH")
+        x = C[wp_name]
+        # Se o waypoint ficou para trás (geometricamente inválido), vai até o fim
+        return x if x > current_x else C["FINISH"]
+
+    def _sample_route(self, entry: str) -> list:
+        """Sorteia uma sequência de ações para o entry point dado."""
+        options = self._routes[entry]
+        total   = sum(w for w, _ in options)
+        r       = self._rng.random() * total
+        cum     = 0.0
+        for weight, actions in options:
+            cum += weight
             if r < cum:
-                return intent
-        return UAV_INTENTS.CRUISE
+                return list(actions)
+        return ["FINISH"]

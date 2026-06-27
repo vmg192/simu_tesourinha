@@ -1,137 +1,220 @@
-"""Gera gráficos a partir de results.csv (saída de run_tesourinha.py)."""
+"""Análise focada dos resultados da simulação."""
 
 from pathlib import Path
-
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import pandas as pd
+import numpy as np
 
 CSV_PATH = Path("results.csv")
-OUT_DIR = Path("plots")
+OUT_DIR  = Path("plots")
 
 
-def load_results(path: Path = CSV_PATH) -> pd.DataFrame:
+def load(path: Path = CSV_PATH) -> pd.DataFrame:
     df = pd.read_csv(path)
     df["speed"] = df["speed"].astype(int)
-    df["lam"] = df["lam"].astype(int)
+    df["lam"]   = df["lam"].astype(int)
     return df
 
 
-def _style_axes(ax, title: str, xlabel: str, ylabel: str) -> None:
-    ax.set_title(title, fontsize=11, pad=8)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    ax.grid(True, alpha=0.3, linestyle="--")
-    ax.legend(fontsize=8, loc="best", framealpha=0.9)
+def _critical_lambda(group: pd.DataFrame, threshold: float = 95.0) -> float:
+    """Menor λ onde sat_pct cai abaixo do threshold. Retorna inf se nunca cai."""
+    sat = group.sort_values("lam")
+    below = sat[sat["sat_pct"] < threshold]
+    return float(below["lam"].min()) if not below.empty else float("inf")
 
 
-def plot_metrics_vs_lambda(df: pd.DataFrame, out_dir: Path) -> None:
+# ── Plot 1: Fronteira de saturação ────────────────────────────────────────────
+# Pergunta: em que λ cada velocidade começa a saturar?
+# Mostra média + banda min/max entre todos os cenários.
+
+def plot_saturation_frontier(df: pd.DataFrame, out_dir: Path) -> Path:
     speeds = sorted(df["speed"].unique())
-    colors = plt.cm.viridis([i / max(1, len(speeds) - 1) for i in range(len(speeds))])
+    lambdas = sorted(df["lam"].unique())
+    colors = plt.cm.viridis(np.linspace(0, 1, len(speeds)))
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10), sharex=True)
-    fig.suptitle("Desempenho da Air Tesourinha — grid search", fontsize=14, y=0.98)
+    fig, ax = plt.subplots(figsize=(11, 6))
 
-    metrics = [
-        ("avg_done", "Throughput médio (drones/4h)", axes[0, 0]),
-        ("avg_wait_s", "Espera média nos merge nodes (s)", axes[0, 1]),
-        ("avg_spill", "Eventos de spillback (média)", axes[1, 0]),
-        ("sat_pct", "Saturação (% da demanda atendida)", axes[1, 1]),
-    ]
+    for speed, color in zip(speeds, colors):
+        sub = df[df["speed"] == speed]
+        # agrega sobre todos os cenários em cada λ
+        agg = sub.groupby("lam")["sat_pct"].agg(["mean", "min", "max"]).reset_index()
+        slots = df[df["speed"] == speed]["n_slots"].iloc[0]
 
-    for col, ylabel, ax in metrics:
-        for speed, color in zip(speeds, colors):
-            sub = df[df["speed"] == speed].sort_values("lam")
-            slots = sub["n_slots"].iloc[0]
-            ax.plot(
-                sub["lam"],
-                sub[col],
-                marker="o",
-                markersize=4,
-                linewidth=1.8,
-                color=color,
-                label=f"v={speed} m/s ({slots} slots)",
-            )
-        if col == "sat_pct":
-            ax.axhline(95, color="crimson", linestyle=":", linewidth=1.2, label="limiar 95%")
-        _style_axes(ax, ylabel, "Demanda λ (drones/h)", ylabel)
+        ax.plot(agg["lam"], agg["mean"],
+                color=color, linewidth=2,
+                label=f"v={speed} m/s ({slots} slot{'s' if slots > 1 else ''})")
+        ax.fill_between(agg["lam"], agg["min"], agg["max"],
+                        color=color, alpha=0.15)
+
+    ax.axhline(95, color="crimson", linestyle="--", linewidth=1.2, label="limiar 95%")
+    ax.set_xlabel("Demanda λ (drones/h)", fontsize=11)
+    ax.set_ylabel("Saturação — % da demanda atendida", fontsize=11)
+    ax.set_title("Fronteira de saturação por velocidade\n"
+                 "(linha = média entre cenários · banda = min/max)", fontsize=12)
+    ax.set_ylim(0, 105)
+    ax.legend(fontsize=9, loc="lower left")
+    ax.grid(True, alpha=0.3, linestyle="--")
 
     plt.tight_layout()
-    fig.savefig(out_dir / "metricas_vs_lambda.png", dpi=200, bbox_inches="tight")
+    path = out_dir / "1_saturacao_frontier.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
+    return path
 
 
-def plot_heatmaps(df: pd.DataFrame, out_dir: Path) -> None:
-    metrics = [
-        ("avg_wait_s", "Espera média (s)", "YlOrRd"),
-        ("avg_spill", "Spillback (média)", "Reds"),
-        ("sat_pct", "Saturação (%)", "RdYlGn"),
-    ]
+# ── Plot 2: λ* por velocidade com barra de variação entre cenários ────────────
+# Pergunta: o ponto de saturação é estável ou depende muito do cenário?
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    fig.suptitle("Mapas de calor — velocidade × demanda", fontsize=14, y=1.02)
+def plot_critical_lambda(df: pd.DataFrame, out_dir: Path) -> Path:
+    speeds = sorted(df["speed"].unique())
+    scenarios = df[["source_scenario", "route_scenario"]].drop_duplicates()
+    scenario_keys = list(zip(scenarios["source_scenario"], scenarios["route_scenario"]))
 
-    for ax, (col, title, cmap) in zip(axes, metrics):
-        pivot = df.pivot(index="speed", columns="lam", values=col)
-        im = ax.imshow(pivot.values, aspect="auto", cmap=cmap, origin="lower")
-        ax.set_xticks(range(len(pivot.columns)))
-        ax.set_xticklabels(pivot.columns, rotation=45, ha="right")
-        ax.set_yticks(range(len(pivot.index)))
-        ax.set_yticklabels([f"{v} m/s" for v in pivot.index])
-        ax.set_xlabel("λ (drones/h)")
-        ax.set_ylabel("Velocidade")
-        ax.set_title(title)
-        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.ax.tick_params(labelsize=8)
+    # λ* por (speed, cenário)
+    records = []
+    for speed in speeds:
+        for src, rte in scenario_keys:
+            sub = df[(df["speed"] == speed) &
+                     (df["source_scenario"] == src) &
+                     (df["route_scenario"] == rte)]
+            lstar = _critical_lambda(sub)
+            records.append({"speed": speed, "lstar": lstar, "src": src, "rte": rte})
+
+    agg = pd.DataFrame(records)
+    summary = agg.groupby("speed")["lstar"].agg(["mean", "min", "max"]).reset_index()
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    x = range(len(speeds))
+
+    bars = ax.bar(x, summary["mean"],
+                  color=plt.cm.viridis(np.linspace(0.2, 0.8, len(speeds))),
+                  edgecolor="white", width=0.55, zorder=3)
+
+    # erro = variação entre cenários
+    yerr_low  = summary["mean"] - summary["min"]
+    yerr_high = summary["max"] - summary["mean"]
+    ax.errorbar(x, summary["mean"],
+                yerr=[yerr_low, yerr_high],
+                fmt="none", color="black", capsize=6, linewidth=1.5, zorder=4)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"{v} m/s" for v in speeds])
+    ax.set_xlabel("Velocidade", fontsize=11)
+    ax.set_ylabel("λ* — densidade crítica (drones/h)", fontsize=11)
+    ax.set_title("Ponto de saturação por velocidade\n"
+                 "(barra = média · traço = variação entre cenários)", fontsize=12)
+    ax.grid(axis="y", alpha=0.3, linestyle="--", zorder=0)
+
+    for bar, val in zip(bars, summary["mean"]):
+        if val < float("inf"):
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 8,
+                    f"{val:.0f}", ha="center", fontsize=9)
+        else:
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    ax.get_ylim()[1] * 0.85,
+                    "sem sat.", ha="center", fontsize=9, color="green")
 
     plt.tight_layout()
-    fig.savefig(out_dir / "heatmaps.png", dpi=200, bbox_inches="tight")
+    path = out_dir / "2_lambda_critico.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
+    return path
 
 
-def plot_capacity(df: pd.DataFrame, out_dir: Path) -> None:
-    by_speed = (
-        df.groupby("speed", as_index=False)
-        .agg(n_slots=("n_slots", "first"), gfence_m=("gfence_m", "first"))
-        .sort_values("speed")
-    )
+# ── Plot 3: Heatmap do pior caso ──────────────────────────────────────────────
+# Pergunta: qual é a performance MÍNIMA garantida independente do cenário?
+# Se o pior caso ainda é aceitável, a arquitetura é robusta.
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
-    fig.suptitle("Capacidade física da via por velocidade", fontsize=13)
+def plot_worst_case_heatmap(df: pd.DataFrame, out_dir: Path) -> Path:
+    # pior caso = mínimo de sat_pct entre todos os cenários
+    worst = df.groupby(["speed", "lam"])["sat_pct"].min().reset_index()
+    pivot = worst.pivot(index="speed", columns="lam", values="sat_pct")
 
-    bars = ax1.bar(
-        by_speed["speed"].astype(str) + " m/s",
-        by_speed["n_slots"],
-        color=plt.cm.Blues(by_speed["n_slots"] / by_speed["n_slots"].max()),
-        edgecolor="white",
-    )
-    ax1.set_ylabel("Slots simultâneos na via (60 m)")
-    ax1.set_xlabel("Velocidade de cruzeiro")
-    ax1.set_title("Capacidade em slots")
-    ax1.grid(axis="y", alpha=0.3, linestyle="--")
-    for bar, val in zip(bars, by_speed["n_slots"]):
-        ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05, str(val), ha="center", fontsize=10)
+    fig, ax = plt.subplots(figsize=(13, 4))
+    im = ax.imshow(pivot.values, aspect="auto", cmap="RdYlGn",
+                   vmin=0, vmax=100, origin="lower")
 
-    ax2.plot(by_speed["speed"], by_speed["gfence_m"], marker="s", color="darkorange", linewidth=2)
-    ax2.set_xlabel("Velocidade (m/s)")
-    ax2.set_ylabel("Geofence G(v) (m)")
-    ax2.set_title("Bolha de segurança")
-    ax2.grid(True, alpha=0.3, linestyle="--")
-    ax2.set_xticks(by_speed["speed"])
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels(pivot.columns, rotation=45, ha="right", fontsize=8)
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels([f"{v} m/s" for v in pivot.index])
+    ax.set_xlabel("Demanda λ (drones/h)")
+    ax.set_ylabel("Velocidade")
+    ax.set_title("Saturação — PIOR CASO entre todos os cenários (%)\n"
+                 "(verde = sistema suporta · vermelho = saturação garantida)", fontsize=11)
+
+    # anota células
+    for i in range(len(pivot.index)):
+        for j in range(len(pivot.columns)):
+            val = pivot.values[i, j]
+            if not np.isnan(val):
+                ax.text(j, i, f"{val:.0f}",
+                        ha="center", va="center", fontsize=7,
+                        color="black" if 30 < val < 80 else "white")
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
+    cbar.ax.tick_params(labelsize=8)
 
     plt.tight_layout()
-    fig.savefig(out_dir / "capacidade_fisica.png", dpi=200, bbox_inches="tight")
+    path = out_dir / "3_pior_caso_heatmap.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
+    return path
 
 
-def plot_results(csv_path: Path = CSV_PATH, out_dir: Path = OUT_DIR) -> list[Path]:
+# ── Plot 4: Spillback — aviso antecipado ──────────────────────────────────────
+# Pergunta: onde o congestionamento começa, antes mesmo da saturação?
+# Spillback > 0 indica que a via está bloqueando, mesmo que sat_pct ainda seja alta.
+
+def plot_spillback_onset(df: pd.DataFrame, out_dir: Path) -> Path:
+    speeds  = sorted(df["speed"].unique())
+    colors  = plt.cm.viridis(np.linspace(0, 1, len(speeds)))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("Spillback — sinal antecipado de congestionamento", fontsize=12)
+
+    for speed, color in zip(speeds, colors):
+        sub = df[df["speed"] == speed]
+        agg = sub.groupby("lam")["avg_spill"].agg(["mean", "max"]).reset_index()
+        slots = df[df["speed"] == speed]["n_slots"].iloc[0]
+        label = f"v={speed} m/s ({slots} slots)"
+
+        ax1.plot(agg["lam"], agg["mean"],
+                 color=color, linewidth=2, marker="o", markersize=3, label=label)
+        ax2.plot(agg["lam"], agg["max"],
+                 color=color, linewidth=2, marker="o", markersize=3, label=label)
+
+    for ax, title in zip([ax1, ax2],
+                         ["Spillback médio entre cenários",
+                          "Spillback máximo (pior cenário)"]):
+        ax.set_xlabel("Demanda λ (drones/h)", fontsize=10)
+        ax.set_ylabel("Eventos de spillback por rodada", fontsize=10)
+        ax.set_title(title, fontsize=11)
+        ax.grid(True, alpha=0.3, linestyle="--")
+        ax.legend(fontsize=8, loc="upper left")
+
+    plt.tight_layout()
+    path = out_dir / "4_spillback_onset.png"
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def plot_results(csv_path: Path = CSV_PATH, out_dir: Path = OUT_DIR) -> list:
     out_dir.mkdir(parents=True, exist_ok=True)
-    df = load_results(csv_path)
+    df = load(csv_path)
 
-    plot_metrics_vs_lambda(df, out_dir)
-    plot_heatmaps(df, out_dir)
-    plot_capacity(df, out_dir)
+    outputs = [
+        plot_saturation_frontier(df, out_dir),
+        plot_critical_lambda(df, out_dir),
+        plot_worst_case_heatmap(df, out_dir),
+        plot_spillback_onset(df, out_dir),
+    ]
 
-    outputs = sorted(out_dir.glob("*.png"))
     return outputs
 
 
